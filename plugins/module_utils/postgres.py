@@ -367,7 +367,8 @@ class PgRole():
 
 
 class PgMembership(object):
-    def __init__(self, module, cursor, groups, target_roles, fail_on_role=True, options=None):
+    def __init__(self, module, cursor, groups, target_roles, fail_on_role=True, options=None,
+                 grantor_scoped=False):
         self.module = module
         self.cursor = cursor
         self.target_roles = [r.strip() for r in target_roles]
@@ -382,40 +383,134 @@ class PgMembership(object):
         self.fail_on_role = fail_on_role
         self.non_existent_roles = []
         self.changed = False
+        # On PostgreSQL 16+ a (group, role) pair can be granted independently by
+        # several roles, so a membership is identified by (group, role, grantor)
+        # and this module manages only the grant made by the connecting role.
+        # Before 16 pg_auth_members is unique on (roleid, member): the grantor is
+        # not part of the membership identity, so it is ignored there.
+        self.grantor_scoped = grantor_scoped
+        self.current_role = None
+        if self.grantor_scoped:
+            rows = exec_sql(self, "SELECT CURRENT_ROLE AS role", add_to_executed=False)
+            self.current_role = rows[0]['role']
         self.__check_roles_exist()
 
-    def __grant(self, group, role, role_obj=None):
+    def __grants(self, group, role):
+        """Return every grant of group to role, one entry per grantor.
+
+        Args:
+            group (str) -- granted (group) role.
+            role (str) -- member role.
+
+        Returns a list of dicts with a 'grantor' key plus the membership options
+        the server knows about (ADMIN always; INHERIT and SET on PostgreSQL 16+).
+        """
+        if self.grantor_scoped:
+            columns = "m.admin_option, m.inherit_option, m.set_option"
+        else:
+            columns = "m.admin_option"
+
+        query = """SELECT gr.rolname AS grantor, %s
+                   FROM pg_catalog.pg_auth_members m
+                   JOIN pg_catalog.pg_roles g ON m.roleid = g.oid
+                   JOIN pg_catalog.pg_roles u ON m.member = u.oid
+                   JOIN pg_catalog.pg_roles gr ON m.grantor = gr.oid
+                   WHERE g.rolname = %%s AND u.rolname = %%s;""" % columns
+
+        grants = []
+        for row in exec_sql(self, query, query_params=(group, role),
+                            add_to_executed=False):
+            grant = dict(grantor=row['grantor'], ADMIN=row['admin_option'])
+            if self.grantor_scoped:
+                grant['INHERIT'] = row['inherit_option']
+                grant['SET'] = row['set_option']
+            grants.append(grant)
+        return grants
+
+    def __own_grant(self, grants):
+        """Return the grant this module manages, or None when it does not exist.
+
+        Args:
+            grants (list) -- grants of a pair as returned by __grants.
+        """
+        if self.grantor_scoped:
+            for grant in grants:
+                if grant['grantor'] == self.current_role:
+                    return grant
+            return None
+
+        # Before PostgreSQL 16 there is at most one grant per pair.
+        return grants[0] if grants else None
+
+    def __foreign_grantors(self, grants):
+        """Return the grantors of a pair other than the connecting role."""
+        if not self.grantor_scoped:
+            return []
+        return sorted(grant['grantor'] for grant in grants
+                      if grant['grantor'] != self.current_role)
+
+    def __warn_foreign_membership(self, group, role, grants):
+        """Warn that a membership survives this module because others granted it.
+
+        Called with the grants read *before* the change, so it is check_mode safe.
+        """
+        grantors = self.__foreign_grantors(grants)
+        if not grantors:
+            return
+
+        self.module.warn(
+            'Role "%s" remains a member of "%s" through the grant(s) made by %s. '
+            'This module only manages the grant made by "%s", so the membership '
+            'and its effective options are not fully removed.'
+            % (role, group, ", ".join('"%s"' % g for g in grantors), self.current_role))
+
+    def __warn_foreign_options(self, group, role, grants):
+        """Warn that grants made by others keep an option the caller cleared.
+
+        PostgreSQL applies membership options as the union of all grants, so
+        clearing an option on the grant this module manages does not clear it
+        when another role granted it too.
+
+        Called with the grants read *before* the change, so it is check_mode safe.
+        """
+        foreign = [grant for grant in grants
+                   if grant['grantor'] != self.current_role] if self.grantor_scoped else []
+        if not foreign:
+            return
+
+        for option, wanted in self.options.items():
+            if wanted:
+                continue
+
+            grantors = sorted(grant['grantor'] for grant in foreign if grant[option])
+            if grantors:
+                self.module.warn(
+                    'Role "%s" keeps the %s option on "%s" through the grant(s) made by %s. '
+                    'This module only manages the grant made by "%s", so %s_option=false '
+                    'does not remove it.'
+                    % (role, option, group, ", ".join('"%s"' % g for g in grantors),
+                       self.current_role, option.lower()))
+
+    def __grant(self, group, role, grants):
         """Grant membership of group to role and apply the wanted options.
 
-        With options (PostgreSQL 16+) only the grant made by the current role is
-        compared and updated, so a membership granted by another role (for
-        example the WITH ADMIN OPTION grant PostgreSQL creates when a
-        non-superuser creates a role) does not hide the need to issue our own
-        grant (see issue #757).
+        Only the grant this module manages is compared and updated, so a
+        membership granted by another role (for example the WITH ADMIN OPTION
+        grant PostgreSQL creates when a non-superuser creates a role) does not
+        hide the need to issue our own grant (see issue #757).
 
         Args:
             group (str) -- role whose membership is granted.
             role (str) -- role that receives the membership.
-            role_obj (PgRole) -- role's already-fetched membership state, to
-                avoid a redundant DB round trip when the caller already has it.
+            grants (list) -- grants of the pair as returned by __grants.
 
         Returns True when a change was made (bool).
         """
-        # Two intentionally different scopes meet here. role_obj.memberof is
-        # grantor-blind: it answers "is role a member of group at all", which is
-        # the historical meaning of membership and stays unchanged. The options
-        # comparison below is grantor-scoped (__current_grant_options only reads
-        # the grant made by the current role), because on PostgreSQL 16+ the same
-        # pair can be granted independently by several roles and we may only
-        # update our own grant. When a membership exists but was granted only by
-        # someone else, __current_grant_options returns None and we fall through
-        # to issue our own grant (see issue #757).
-        role_obj = role_obj or PgRole(self.module, self.cursor, role)
-        if group in role_obj.memberof:
-            current = self.__current_grant_options(group, role) if self.options else {}
-            if current is not None and all(current[option] == wanted
-                                           for option, wanted in self.options.items()):
-                return False
+        self.__warn_foreign_options(group, role, grants)
+        current = self.__own_grant(grants)
+        if current is not None and all(current[option] == wanted
+                                       for option, wanted in self.options.items()):
+            return False
 
         query = 'GRANT "%s" TO "%s"' % (group, role)
         changed = False
@@ -427,91 +522,152 @@ class PgMembership(object):
         self.changed |= changed
         return changed
 
-    def __current_grant_options(self, group, role):
-        """Return the options of the group-to-role grant made by the current role.
+    def __revoke(self, group, role, grants):
+        """Revoke the grant of group to role this module manages.
 
-        Only reached on PostgreSQL 16+, where these columns exist and a pair can
-        be granted by several roles independently.
+        A plain REVOKE only removes the grant made by the connecting role, so on
+        PostgreSQL 16+ a membership granted by somebody else survives it. That is
+        reported through a warning rather than silently claiming success.
+
+        Args:
+            group (str) -- role whose membership is revoked.
+            role (str) -- role that loses the membership.
+            grants (list) -- grants of the pair as returned by __grants.
+
+        Returns True when a change was made (bool).
+        """
+        changed = False
+        if self.__own_grant(grants) is not None:
+            query = 'REVOKE "%s" FROM "%s"' % (group, role)
+            changed = exec_sql(self, query, return_bool=True)
+            self.changed |= changed
+
+        self.__warn_foreign_membership(group, role, grants)
+        return changed
+
+    def __known_options(self):
+        """Return the membership options the server supports."""
+        return ('ADMIN', 'INHERIT', 'SET') if self.grantor_scoped else ('ADMIN',)
+
+    def effective_options(self, group, role):
+        """Return the options a member effectively holds for a group.
+
+        PostgreSQL applies membership options as the union of every grant of the
+        pair: the member holds an option when any grant carries it. Reported so
+        callers can see privileges conferred by grants this module does not own.
 
         Args:
             group (str) -- granted (group) role.
             role (str) -- member role.
 
-        Returns a dict with ADMIN, INHERIT and SET keys, or None when the
-        current role has not granted this membership.
+        Returns a dict keyed by the module's option names, or None when role is
+        not a member of group.
         """
-        query = """SELECT m.admin_option, m.inherit_option, m.set_option
+        grants = self.__grants(group, role)
+        if not grants:
+            return None
+
+        return dict(('%s_option' % option.lower(),
+                     any(grant[option] for grant in grants))
+                    for option in self.__known_options())
+
+    def grants(self, group, role):
+        """Return every grant of group to role, for reporting.
+
+        Args:
+            group (str) -- granted (group) role.
+            role (str) -- member role.
+
+        Returns a list of dicts keyed by 'grantor' plus the module's option names.
+        """
+        reported = []
+        for grant in self.__grants(group, role):
+            entry = dict(grantor=grant['grantor'])
+            for option in self.__known_options():
+                entry['%s_option' % option.lower()] = grant[option]
+            reported.append(entry)
+        return reported
+
+    def __role_grants(self, role):
+        """Return every membership of role, grouped by group.
+
+        One query per role instead of one per (group, role) pair.
+
+        Args:
+            role (str) -- member role.
+
+        Returns a dict mapping a group name to its list of grants (see __grants).
+        """
+        if self.grantor_scoped:
+            columns = "m.admin_option, m.inherit_option, m.set_option"
+        else:
+            columns = "m.admin_option"
+
+        query = """SELECT g.rolname AS grp, gr.rolname AS grantor, %s
                    FROM pg_catalog.pg_auth_members m
                    JOIN pg_catalog.pg_roles g ON m.roleid = g.oid
                    JOIN pg_catalog.pg_roles u ON m.member = u.oid
-                   WHERE g.rolname = %s
-                     AND u.rolname = %s
-                     AND m.grantor = (SELECT oid
-                                      FROM pg_catalog.pg_roles
-                                      WHERE rolname = CURRENT_ROLE);"""
-        rows = exec_sql(self, query, query_params=(group, role),
-                        add_to_executed=False)
-        if not rows:
-            return None
-        return dict(ADMIN=rows[0]['admin_option'],
-                    INHERIT=rows[0]['inherit_option'],
-                    SET=rows[0]['set_option'])
+                   JOIN pg_catalog.pg_roles gr ON m.grantor = gr.oid
+                   WHERE u.rolname = %%s;""" % columns
+
+        memberships = {}
+        for row in exec_sql(self, query, query_params=(role,),
+                            add_to_executed=False):
+            grant = dict(grantor=row['grantor'], ADMIN=row['admin_option'])
+            if self.grantor_scoped:
+                grant['INHERIT'] = row['inherit_option']
+                grant['SET'] = row['set_option']
+            memberships.setdefault(row['grp'], []).append(grant)
+        return memberships
+
+    def __managed_groups(self, memberships):
+        """Return the groups whose grant to a role this module manages."""
+        return set(group for group, grants in memberships.items()
+                   if self.__own_grant(grants) is not None)
 
     def grant(self):
-        role_objs = {role: PgRole(self.module, self.cursor, role) for role in self.target_roles}
-        for group in self.groups:
-            self.granted[group] = []
+        for role in self.target_roles:
+            memberships = self.__role_grants(role)
 
-            for role in self.target_roles:
-                if self.__grant(group, role, role_objs[role]):
+            for group in self.groups:
+                self.granted.setdefault(group, [])
+                if self.__grant(group, role, memberships.get(group, [])):
                     self.granted[group].append(role)
 
         return self.changed
 
     def revoke(self):
-        for group in self.groups:
-            self.revoked[group] = []
+        for role in self.target_roles:
+            memberships = self.__role_grants(role)
 
-            for role in self.target_roles:
-                role_obj = PgRole(self.module, self.cursor, role)
-                # If role is not in a group now, pass:
-                if group not in role_obj.memberof:
-                    continue
-
-                query = 'REVOKE "%s" FROM "%s"' % (group, role)
-                self.changed = exec_sql(self, query, return_bool=True)
-
-                if self.changed:
+            for group in self.groups:
+                self.revoked.setdefault(group, [])
+                if self.__revoke(group, role, memberships.get(group, [])):
                     self.revoked[group].append(role)
 
         return self.changed
 
     def match(self):
         for role in self.target_roles:
-            role_obj = PgRole(self.module, self.cursor, role)
+            memberships = self.__role_grants(role)
 
             desired_groups = set(self.groups)
-            current_groups = set(role_obj.memberof)
-            # 1. Get groups that the role is member of but not in self.groups and revoke them
-            groups_to_revoke = current_groups - desired_groups
-            for group in groups_to_revoke:
-                query = 'REVOKE "%s" FROM "%s"' % (group, role)
-                self.changed = exec_sql(self, query, return_bool=True)
-                if group in self.revoked:
-                    self.revoked[group].append(role)
-                else:
-                    self.revoked[group] = [role]
+            # Only the memberships this module manages can be revoked, so those
+            # are the ones state=exact reconciles against.
+            current_groups = self.__managed_groups(memberships)
+
+            # 1. Revoke the groups the role is a member of but that are not wanted.
+            for group in current_groups - desired_groups:
+                if self.__revoke(group, role, memberships.get(group, [])):
+                    self.revoked.setdefault(group, []).append(role)
 
             # 2. Ensure the role is a member of every desired group with the
             # wanted options. __grant is idempotent and also reconciles the
             # options of memberships that already exist, so it runs for all
             # desired groups, not only the newly added ones.
             for group in desired_groups:
-                if self.__grant(group, role, role_obj):
-                    if group in self.granted:
-                        self.granted[group].append(role)
-                    else:
-                        self.granted[group] = [role]
+                if self.__grant(group, role, memberships.get(group, [])):
+                    self.granted.setdefault(group, []).append(role)
 
         return self.changed
 
