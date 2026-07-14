@@ -30,6 +30,7 @@
       name: "{{ item }}"
     with_items:
     - "grantor_group"
+    - "grantor_keep"
     - "grantor_user"
     - "grantor_other"
 
@@ -157,6 +158,38 @@
       that:
       - result.query_result | map(attribute='grantor') | list == ['grantor_other']
 
+  # state=exact must not silently keep an unwanted membership it cannot revoke:
+  # grantor_group is still granted by grantor_other, and it is not wanted here.
+  - name: postgresql_membership - exact warns about an unwanted membership granted by another role
+    become_user: "{{ pg_user }}"
+    become: true
+    postgresql_membership:
+      login_user: "{{ pg_user }}"
+      db: postgres
+      group: "grantor_keep"
+      target_role: "grantor_user"
+      state: exact
+    register: result
+
+  - assert:
+      that:
+      - result.warnings | select('search', 'remains a member') | list | length > 0
+
+  - name: postgresql_membership - exact converges
+    become_user: "{{ pg_user }}"
+    become: true
+    postgresql_membership:
+      login_user: "{{ pg_user }}"
+      db: postgres
+      group: "grantor_keep"
+      target_role: "grantor_user"
+      state: exact
+    register: result
+
+  - assert:
+      that:
+      - result is not changed
+
   always:
 
   - name: postgresql_membership - drop roles from the grantor tests
@@ -171,6 +204,7 @@
     with_items:
     - "grantor_user"
     - "grantor_other"
+    - "grantor_keep"
     - "grantor_group"
 
 # Before PostgreSQL 16 the grantor is not part of the membership identity: a pair

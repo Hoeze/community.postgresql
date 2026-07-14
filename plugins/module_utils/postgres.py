@@ -620,11 +620,6 @@ class PgMembership(object):
             memberships.setdefault(row['grp'], []).append(grant)
         return memberships
 
-    def __managed_groups(self, memberships):
-        """Return the groups whose grant to a role this module manages."""
-        return set(group for group, grants in memberships.items()
-                   if self.__own_grant(grants) is not None)
-
     def grant(self):
         for role in self.target_roles:
             memberships = self.__role_grants(role)
@@ -652,9 +647,11 @@ class PgMembership(object):
             memberships = self.__role_grants(role)
 
             desired_groups = set(self.groups)
-            # Only the memberships this module manages can be revoked, so those
-            # are the ones state=exact reconciles against.
-            current_groups = self.__managed_groups(memberships)
+            # Every group the role is a member of is considered, whoever granted
+            # it, so that an unwanted membership this module cannot revoke is
+            # still reported instead of being silently left in place. __revoke
+            # revokes the grant we manage, if any, and warns about the rest.
+            current_groups = set(memberships)
 
             # 1. Revoke the groups the role is a member of but that are not wanted.
             for group in current_groups - desired_groups:
