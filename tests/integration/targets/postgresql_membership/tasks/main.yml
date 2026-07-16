@@ -8,3 +8,6 @@
 
 # Tests for admin_option, inherit_option and set_option (PostgreSQL >= 16):
 - import_tasks: postgresql_membership_options.yml
+
+# Tests for the grantor-scoped membership model (PostgreSQL >= 16):
+- import_tasks: postgresql_membership_grantor.yml

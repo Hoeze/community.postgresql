@@ -1,0 +1,8 @@
+breaking_changes:
+  - postgresql_membership - On PostgreSQL 16 and later, a membership is now identified by the group, the target role and the granting role, and the module only manages the grant made by the connecting role. Previously a membership granted by any role was considered. As a result, ``state=present`` now issues its own ``GRANT`` when only another role has granted the membership, and ``state=absent`` and ``state=exact`` no longer report a change for a membership they cannot revoke, because PostgreSQL only lets a role revoke its own grant. The connecting role must hold ``ADMIN OPTION`` on the group. Behaviour on PostgreSQL versions before 16, where a pair can only be granted once and the granting role is not part of the membership identity, is unchanged (https://github.com/ansible-collections/community.postgresql/pull/937).
+
+bugfixes:
+  - postgresql_membership - Fix ``state=absent`` and ``state=exact`` reporting ``changed=true`` on PostgreSQL 16 and later without removing anything when the membership had been granted by another role. A plain ``REVOKE`` only removes the grant made by the connecting role, even for a superuser, so the task never converged. The module now only revokes the grant it manages and warns when the membership survives through a grant made by another role (https://github.com/ansible-collections/community.postgresql/pull/937).
+
+minor_changes:
+  - postgresql_membership - Add the ``grants`` return value, listing every grant of the requested pairs with its granting role, and the ``effective_options`` return value, reporting the membership options the target role actually holds as the union of all grants (https://github.com/ansible-collections/community.postgresql/pull/937).

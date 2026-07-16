@@ -101,18 +101,24 @@ options:
     default: true
     version_added: '0.2.0'
 notes:
-- Whether a role is a member of a group is checked regardless of which role granted
-  the membership, as in earlier versions. The membership options, however, are read
-  and written only for the grant made by the connecting role (or by I(session_role)
-  when set), because on PostgreSQL 16 and later the same pair can be granted
-  independently by several roles, each grant carrying its own options, and a role can
-  only change its own grant.
-- A consequence of that scope is that adding I(admin_option), I(inherit_option) or
-  I(set_option) to a task can report C(changed) and issue a C(GRANT) even when the
-  target role is already a member, if the existing membership was granted by another
-  role. This is intended, C(WITH ADMIN OPTION) memberships PostgreSQL creates
-  automatically when a non-superuser creates a role are a common example, so that the
-  connecting role obtains its own grant with the requested options (see issue #757).
+- On PostgreSQL 16 and later, the same membership can be granted independently by
+  several roles, each grant carrying its own options. A membership is therefore
+  identified by the group, the target role B(and) the granting role, and this module
+  manages only the grant made by the connecting role (or by I(session_role) when set).
+  The connecting role must hold C(ADMIN OPTION) on the group to make such a grant.
+- A consequence is that a membership granted by another role, such as the
+  C(WITH ADMIN OPTION) grant PostgreSQL creates automatically when a non-superuser
+  creates a role, neither prevents the module from creating its own grant nor is
+  removed by I(state=absent) or I(state=exact). PostgreSQL only lets a role revoke
+  its own grant. When such a grant remains, the module warns and reports it in the
+  C(grants) return value.
+- PostgreSQL applies membership options as the union of all grants of a pair, so a
+  target role keeps an option as long as any grant carries it. Setting for example
+  I(admin_option=false) only clears it on the grant this module manages. The
+  C(effective_options) return value reports what the target role actually holds.
+- Before PostgreSQL 16 a pair can only be granted once, the granting role is not part
+  of the membership identity and cannot be changed by re-granting. The grantor is
+  therefore ignored on those versions and the behaviour is unchanged.
 seealso:
 - module: community.postgresql.postgresql_user
 - module: community.postgresql.postgresql_privs
@@ -208,6 +214,30 @@ state:
     returned: success
     type: str
     sample: "present"
+grants:
+    description:
+      - Every grant of the requested groups to the requested target roles, keyed by
+        group and then by target role, with one entry per granting role.
+      - Includes the grants made by roles other than the connecting one, which this
+        module does not manage.
+      - The C(inherit_option) and C(set_option) keys are only present on PostgreSQL 16 and later.
+    returned: success
+    type: dict
+    sample: { "ro_group": { "alice": [ { "grantor": "postgres", "admin_option": false, "inherit_option": true, "set_option": true } ] } }
+    version_added: '5.0.0'
+effective_options:
+    description:
+      - Membership options the target role effectively holds for a group, keyed by
+        group and then by target role.
+      - PostgreSQL applies membership options as the union of every grant of the pair,
+        so an option is C(true) when any grant carries it, including a grant this
+        module does not manage.
+      - Only pairs where the target role is a member are reported.
+      - The C(inherit_option) and C(set_option) keys are only present on PostgreSQL 16 and later.
+    returned: success
+    type: dict
+    sample: { "ro_group": { "alice": { "admin_option": false, "inherit_option": true, "set_option": true } } }
+    version_added: '5.0.0'
 '''
 
 from ansible.module_utils.basic import AnsibleModule
@@ -275,12 +305,22 @@ def main():
     db_connection, dummy = connect_to_db(module, conn_params, autocommit=False)
     cursor = db_connection.cursor(**pg_cursor_args)
 
-    # The admin_option, inherit_option and set_option parameters rely on the
+    # PostgreSQL 16 made role membership per-grantor: the same pair can be granted
+    # independently by several roles, each grant carrying its own options. The
+    # module therefore identifies a membership by (group, role, grantor) and
+    # manages only the grant made by the connecting role.
+    #
+    # Before 16, pg_auth_members is unique on (roleid, member): the grantor is not
+    # part of the membership identity and cannot be rewritten by re-granting, so it
+    # is ignored and the pre-16 behaviour is unchanged.
+    #
+    # The admin_option, inherit_option and set_option parameters also rely on the
     # GRANT ... WITH <option> syntax that only exists on PostgreSQL 16+. Fail
     # explicitly when any of them is set against an older server rather than
     # emitting an invalid statement. The options have no effect when revoking,
     # so they are simply ignored for state=absent (as documented).
-    if get_server_version(db_connection) < 160000:
+    grantor_scoped = get_server_version(db_connection) >= 160000
+    if not grantor_scoped:
         if state != 'absent':
             used_options = [name for name in ('admin_option', 'inherit_option', 'set_option')
                             if module.params[name] is not None]
@@ -291,7 +331,8 @@ def main():
 
     ##############
     # Create the object and do main job:
-    pg_membership = PgMembership(module, cursor, groups, target_roles, fail_on_role, membership_options)
+    pg_membership = PgMembership(module, cursor, groups, target_roles, fail_on_role,
+                                 membership_options, grantor_scoped)
 
     if state == 'present':
         pg_membership.grant()
@@ -301,6 +342,27 @@ def main():
 
     elif state == 'absent':
         pg_membership.revoke()
+
+    # Report every grant of the requested pairs, including the ones made by other
+    # roles, together with the options the member effectively holds (PostgreSQL
+    # applies membership options as the union of all grants). This makes the
+    # privileges conferred by grants the module does not own visible to callers.
+    grants = {}
+    effective_options = {}
+    for group in pg_membership.groups:
+        if group in pg_membership.non_existent_roles:
+            continue
+
+        for role in pg_membership.target_roles:
+            if role in pg_membership.non_existent_roles:
+                continue
+
+            effective = pg_membership.effective_options(group, role)
+            if effective is None:
+                continue
+
+            grants.setdefault(group, {})[role] = pg_membership.grants(group, role)
+            effective_options.setdefault(group, {})[role] = effective
 
     # Rollback if it's possible and check_mode:
     if module.check_mode:
@@ -318,6 +380,8 @@ def main():
         groups=pg_membership.groups,
         target_roles=pg_membership.target_roles,
         queries=pg_membership.executed_queries,
+        grants=grants,
+        effective_options=effective_options,
     )
 
     if state == 'present':
